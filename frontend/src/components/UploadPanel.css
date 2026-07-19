@@ -1,0 +1,40 @@
+.upload-panel { display: flex; justify-content: center; padding: 24px 0; }
+.upload-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 32px;
+  max-width: 640px;
+  width: 100%;
+}
+.upload-title { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.upload-desc { color: #57606a; font-size: 13px; margin-bottom: 24px; line-height: 1.6; }
+
+.drop-zone {
+  border: 2px dashed #d1d5db;
+  border-radius: 8px;
+  padding: 40px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  margin-bottom: 16px;
+}
+.drop-zone:hover, .drop-zone.dragging { border-color: #3b82d4; background: #eff6ff; }
+.drop-zone.has-file { border-style: solid; border-color: #22c55e; background: #f0fdf4; cursor: default; }
+
+.drop-icon { font-size: 40px; display: block; margin-bottom: 12px; }
+.drop-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+.drop-or { color: #57606a; margin: 8px 0; font-size: 13px; }
+
+.file-selected { display: flex; align-items: center; gap: 14px; text-align: left; }
+.file-icon { font-size: 36px; flex-shrink: 0; }
+.file-info { flex: 1; }
+.file-name { font-weight: 600; font-size: 14px; word-break: break-all; }
+.file-size { color: #57606a; font-size: 12px; }
+.remove-btn { font-size: 12px; padding: 4px 10px; flex-shrink: 0; }
+
+.analyze-btn { width: 100%; padding: 12px; font-size: 14px; margin-bottom: 24px; }
+
+.upload-checklist h3 { font-size: 13px; font-weight: 700; color: #57606a; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }
+.upload-checklist ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.upload-checklist li { font-size: 13px; color: #1f2328; }
