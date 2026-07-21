@@ -19,10 +19,18 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (_req, file, cb) => {
-  if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
+  const name = file.originalname.toLowerCase();
+  // Accept standard automation project ZIPs and published .nupkg packages
+  if (
+    file.mimetype === 'application/zip' ||
+    file.mimetype === 'application/x-zip-compressed' ||
+    file.mimetype === 'application/octet-stream' ||
+    name.endsWith('.zip') ||
+    name.endsWith('.nupkg')
+  ) {
     cb(null, true);
   } else {
-    cb(new Error('Only .zip files are allowed'), false);
+    cb(new Error('Only .zip and .nupkg files are allowed'), false);
   }
 };
 
@@ -39,21 +47,59 @@ router.post('/', upload.single('project'), (req, res) => {
     const zip = new AdmZip(req.file.path);
     zip.extractAllTo(extractPath, true);
 
-    // Clean up zip
+    // Clean up uploaded archive
     fs.unlinkSync(req.file.path);
+
+    // Resolve the actual project root (handles both ZIP and nupkg layouts)
+    const projectRoot = resolveProjectRoot(extractPath);
 
     const files = getAllFiles(extractPath);
     res.json({
       sessionId,
       originalName: req.file.originalname,
       extractedFiles: files.map(f => path.relative(extractPath, f)),
-      extractPath
+      extractPath,
+      // Expose resolved project root relative to extraction path (for diagnostics)
+      projectRoot: path.relative(extractPath, projectRoot)
     });
   } catch (err) {
     console.error('[Upload] Extraction error:', err.message);
     res.status(500).json({ error: 'Failed to extract ZIP file.' });
   }
 });
+
+/**
+ * Resolve the automation project root inside an extracted directory.
+ *
+ * Lookup priority:
+ *  1. content/project.json   — published .nupkg package layout
+ *  2. <subdir>/project.json  — standard ZIP where the project lives in a named subdirectory
+ *  3. project.json at root   — flat ZIP (less common but valid)
+ *
+ * Returns `extractPath` unchanged when no project.json can be found at all
+ * (the analyzer will then produce a "not found" finding).
+ */
+function resolveProjectRoot(extractPath) {
+  // 1. nupkg: content/ subfolder
+  const contentRoot = path.join(extractPath, 'content');
+  if (fs.existsSync(path.join(contentRoot, 'project.json'))) return contentRoot;
+
+  // 2. project.json at root
+  if (fs.existsSync(path.join(extractPath, 'project.json'))) return extractPath;
+
+  // 3. Single named sub-directory (standard automation project ZIP)
+  try {
+    const entries = fs.readdirSync(extractPath).filter(f =>
+      fs.statSync(path.join(extractPath, f)).isDirectory()
+    );
+    for (const entry of entries) {
+      const candidate = path.join(extractPath, entry);
+      if (fs.existsSync(path.join(candidate, 'project.json'))) return candidate;
+    }
+  } catch (_) {}
+
+  return extractPath;
+}
 
 function getAllFiles(dir, result = []) {
   fs.readdirSync(dir).forEach(f => {

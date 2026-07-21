@@ -1,7 +1,7 @@
 {
-  "name": "uipath-dep-checker-backend",
+  "name": "automation-project-validator-backend",
   "version": "1.0.0",
-  "description": "UiPath Dependency Verification Backend",
+  "description": "Automation Project Validator Backend",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {

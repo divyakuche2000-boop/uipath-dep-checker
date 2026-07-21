@@ -60,5 +60,5 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`UiPath Dep Checker backend running on http://127.0.0.1:${PORT}`);
+  console.log(`Automation Project Validator backend running on http://127.0.0.1:${PORT}`);
 });

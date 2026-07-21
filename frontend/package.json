@@ -1,5 +1,5 @@
 {
-  "name": "uipath-dep-checker-frontend",
+  "name": "automation-project-validator-frontend",
   "version": "1.0.0",
   "private": true,
   "dependencies": {
