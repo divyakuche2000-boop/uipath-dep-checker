@@ -53,6 +53,46 @@ const CREDENTIAL_PATTERNS = [
   /GetCredential[^>]*Asset\s*=\s*["']([^"']+)["']/g
 ];
 
+/**
+ * Integration activity detectors.
+ *
+ * Each entry maps a dependency type to one or more patterns that, when matched
+ * anywhere in the XAML content, confirm the workflow uses that integration.
+ * Patterns match activity type names, assembly references, or namespace imports.
+ */
+const INTEGRATION_ACTIVITY_PATTERNS = {
+  sharepoint: [
+    /UiPath\.MicrosoftOffice365\.Activities\.Sharepoint/i,
+    /UiPath\.Sharepoint\.Activities/i,
+    /SharePointScope/i,
+    /GetListItems|UploadDocument|DownloadDocument|CreateListItem|UpdateListItem/i
+  ],
+  email: [
+    /UiPath\.Mail\.(?:IMAP|POP3|Exchange|Graph)\.Activities/i,
+    /Office365ApplicationScope/i,
+    /MicrosoftGraphAPI|GraphAPI/i,
+    /GetMail|SendMail|MoveMailMessage|MarkMailAsRead/i,
+    /uma:Office365/i
+  ],
+  smtp: [
+    /UiPath\.Mail\.SMTP\.Activities/i,
+    /SmtpClient|SendSMTP|ui:SendMail/i
+  ],
+  database: [
+    /UiPath\.Database\.Activities/i,
+    /DatabaseActivity|ExecuteQuery|ExecuteNonQuery|BulkInsert/i,
+    /System\.Data\.SqlClient/i
+  ],
+  sap: [
+    /UiPath\.UIAutomation\.Activities.*sap/i,
+    /SAPGuiSession|sapLogon/i
+  ],
+  ftp: [
+    /UiPath\.FTP\.Activities/i,
+    /FtpScope|SftpScope|UploadFiles|DownloadFiles/i
+  ]
+};
+
 // Known XAML namespace base URIs that should never be treated as runtime URLs
 const XAML_NAMESPACE_PREFIXES = [
   'http://schemas.microsoft.com/',
@@ -152,7 +192,6 @@ async function parseXamlFile(filePath) {
     .filter(url => !isNonLiteralValue(url) && !isXamlNamespaceUrl(url));
 
   // Filter non-literals from sets where expressions are commonly used as values
-  // (queues, assets, credentials, excel paths, db strings, invoked workflows)
   const result = {
     file: filePath,
     fileName,
@@ -165,8 +204,17 @@ async function parseXamlFile(filePath) {
     dbConnections:    filterLiterals(rawDbConns),
     invokedWorkflows: filterLiterals(rawInvoked),
     inlineCredentials: [],
-    selectorIssues: []
+    selectorIssues: [],
+    // Integration types detected from activity namespaces / imports in this file
+    integrationTypes: []
   };
+
+  // Detect integration activity types by matching known patterns against the full XAML content
+  for (const [intType, patterns] of Object.entries(INTEGRATION_ACTIVITY_PATTERNS)) {
+    if (patterns.some(rx => { rx.lastIndex = 0; return rx.test(content); })) {
+      result.integrationTypes.push(intType);
+    }
+  }
 
   // Inline credential scan — patterns already exclude {x:Null} and [expr] via look-ahead
   CRED_INLINE_PATTERNS.forEach(rx => {
@@ -192,13 +240,42 @@ async function parseXamlFile(filePath) {
   return result;
 }
 
+/**
+ * Patterns for workflow files that are used only during development or testing
+ * and should be excluded from deployment readiness validation.
+ *
+ * Rules (matched against the base filename, case-insensitive):
+ *  - Exact names: Test.xaml, Debug.xaml, Sample.xaml
+ *  - Wildcard prefixes: Test_*.xaml, Debug_*.xaml, Sample_*.xaml
+ */
+const TEST_WORKFLOW_PATTERNS = [
+  /^test\.xaml$/i,
+  /^test_.+\.xaml$/i,
+  /^debug\.xaml$/i,
+  /^debug_.+\.xaml$/i,
+  /^sample\.xaml$/i,
+  /^sample_.+\.xaml$/i
+];
+
+function isTestWorkflow(fileName) {
+  return TEST_WORKFLOW_PATTERNS.some(rx => rx.test(fileName));
+}
+
 async function parseAllXamlFiles(projectRoot) {
   const results = [];
+  const skipped = [];
+
   function walk(dir) {
     fs.readdirSync(dir).forEach(f => {
       const full = path.join(dir, f);
       if (fs.statSync(full).isDirectory()) walk(full);
-      else if (f.endsWith('.xaml')) results.push(full);
+      else if (f.endsWith('.xaml')) {
+        if (isTestWorkflow(f)) {
+          skipped.push(f);
+        } else {
+          results.push(full);
+        }
+      }
     });
   }
   walk(projectRoot);
@@ -206,8 +283,20 @@ async function parseAllXamlFiles(projectRoot) {
   const parsed = [];
   for (const f of results) {
     try { parsed.push(await parseXamlFile(f)); }
-    catch (e) { parsed.push({ file: f, fileName: path.basename(f), error: e.message }); }
+    catch (e) { parsed.push({ file: f, fileName: path.basename(f), error: e.message,
+                              queues: [], assets: [], credentials: [], urls: [],
+                              filePaths: [], excelFiles: [], dbConnections: [],
+                              invokedWorkflows: [], inlineCredentials: [], selectorIssues: [],
+                              integrationTypes: [] }); }
   }
+
+  // Aggregate all integration types detected across every workflow file
+  const allIntegrationTypes = new Set();
+  parsed.forEach(xf => (xf.integrationTypes || []).forEach(t => allIntegrationTypes.add(t)));
+
+  // Attach metadata to the array itself so the analyzer can consume it
+  parsed.skippedTestWorkflows = skipped;
+  parsed.integrationTypes     = [...allIntegrationTypes];
   return parsed;
 }
 

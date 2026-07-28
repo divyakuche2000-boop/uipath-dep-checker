@@ -7,24 +7,30 @@ import './Dashboard.css';
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const CAT_META = {
-  'Project Summary':          { color: '#3b82d4', icon: '📦' },
-  'Dependencies':             { color: '#7c5cd8', icon: '🔗' },
+  // Project Summary — metadata only (framework, output type, project.json health)
+  'Project Summary':          { color: '#3b82d4', icon: '📋' },
+  // Dependencies — packages, queues, assets, credentials, DBs, APIs, paths, URLs
+  'Dependencies':             { color: '#7c5cd8', icon: '📦' },
   'Configuration Validation': { color: '#059669', icon: '⚙' },
   'Environment Validation':   { color: '#d97706', icon: '🌍' },
   'External Resources':       { color: '#0891b2', icon: '🌐' },
   'Security Checks':          { color: '#dc2626', icon: '🔒' },
-  // legacy
-  Library:      { color: '#3b82d4', icon: '📦' },
-  Orchestrator: { color: '#7c5cd8', icon: '🔗' },
+  // legacy aliases kept for backwards-compatibility with old reports
+  Library:      { color: '#7c5cd8', icon: '📦' },
+  Orchestrator: { color: '#7c5cd8', icon: '📦' },
   Data:         { color: '#059669', icon: '⚙' },
   Application:  { color: '#d97706', icon: '🌍' },
   Integration:  { color: '#dc2626', icon: '🔒' },
 };
 
 const STATUS_META = {
-  Pass:    { bg: '#f0fdf4', color: '#15803d', border: '#86efac', icon: '✓', label: 'Passed'   },
-  Warning: { bg: '#fffbeb', color: '#92400e', border: '#fcd34d', icon: '⚠', label: 'Warning'  },
-  Fail:    { bg: '#fff1f2', color: '#be123c', border: '#fda4af', icon: '✕', label: 'Critical' },
+  Pass:    { bg: '#f0fdf4', color: '#15803d', border: '#86efac', icon: '✓', label: 'Passed'     },
+  // Info = "Configured — external verification required"
+  // Carries zero scoring penalty. Used for dependencies that are detected and correctly
+  // configured but whose runtime existence cannot be verified without environment access.
+  Info:    { bg: '#eff6ff', color: '#1d4ed8', border: '#93c5fd', icon: '●', label: 'Configured' },
+  Warning: { bg: '#fffbeb', color: '#92400e', border: '#fcd34d', icon: '⚠', label: 'Warning'    },
+  Fail:    { bg: '#fff1f2', color: '#be123c', border: '#fda4af', icon: '✕', label: 'Critical'   },
 };
 
 const PAGE_SIZE = 20;
@@ -35,10 +41,29 @@ function catColor(cat)  { return (CAT_META[cat] || CAT_META['Project Summary']).
 function catIcon(cat)   { return (CAT_META[cat] || CAT_META['Project Summary']).icon; }
 function statusMeta(s)  { return STATUS_META[s] || STATUS_META['Warning']; }
 
-/** Deployment readiness score: weighted penalty per Fail (8pts) and Warning (2pts). */
-function calcReadiness(summary) {
+/**
+ * Deployment readiness score.
+ *
+ * Penalty weights:
+ *   Fail    → 8 pts  (real blockers)
+ *   Warning → 2 pts  (actionable warnings only)
+ *
+ * "Manual verification required" warnings (queues, assets, credentials, etc.)
+ * are informational — the user cannot fix them at analysis time — so they are
+ * excluded from the Warning penalty to avoid false "Not Ready" verdicts on
+ * otherwise healthy projects.
+ */
+function calcReadiness(summary, findings) {
   if (!summary || summary.total === 0) return 100;
-  const raw = 100 - (summary.fail * 8) - (summary.warning * 2);
+
+  // Info findings carry zero penalty — they are "configured, verify at runtime".
+  // Only genuine Warnings (actionable issues) and Fails count against the score.
+  const fails    = summary.fail    || 0;
+  const warnings = findings
+    ? findings.filter(f => f.status === 'Warning').length
+    : (summary.warning || 0);
+
+  const raw = 100 - (fails * 8) - (warnings * 2);
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
@@ -101,27 +126,29 @@ function CategoryBarChart({ findings }) {
   const cats = useMemo(() => {
     const map = {};
     findings.forEach(f => {
-      if (!map[f.category]) map[f.category] = { pass: 0, warn: 0, fail: 0 };
-      if (f.status === 'Pass')    map[f.category].pass++;
+      if (!map[f.category]) map[f.category] = { pass: 0, info: 0, warn: 0, fail: 0 };
+      if      (f.status === 'Pass')    map[f.category].pass++;
+      else if (f.status === 'Info')    map[f.category].info++;
       else if (f.status === 'Warning') map[f.category].warn++;
       else                             map[f.category].fail++;
     });
-    return Object.entries(map).map(([cat, v]) => ({ cat, ...v, total: v.pass + v.warn + v.fail }));
+    return Object.entries(map).map(([cat, v]) => ({ cat, ...v, total: v.pass + v.info + v.warn + v.fail }));
   }, [findings]);
 
   const max = Math.max(...cats.map(c => c.total), 1);
   return (
     <div className="db-bar-chart">
-      {cats.map(({ cat, pass, warn, fail, total }) => (
+      {cats.map(({ cat, pass, info, warn, fail, total }) => (
         <div key={cat} className="db-bar-row">
           <div className="db-bar-label">
             <span className="db-bar-icon">{catIcon(cat)}</span>
             <span className="db-bar-cat">{cat}</span>
           </div>
           <div className="db-bar-track">
-            {fail  > 0 && <div className="db-bar-seg db-bar-fail"  style={{ width: `${(fail  / max) * 100}%` }} title={`${fail} Critical`}  />}
-            {warn  > 0 && <div className="db-bar-seg db-bar-warn"  style={{ width: `${(warn  / max) * 100}%` }} title={`${warn} Warning`}   />}
-            {pass  > 0 && <div className="db-bar-seg db-bar-pass"  style={{ width: `${(pass  / max) * 100}%` }} title={`${pass} Passed`}    />}
+            {fail  > 0 && <div className="db-bar-seg db-bar-fail"  style={{ width: `${(fail  / max) * 100}%` }} title={`${fail} Critical`}   />}
+            {warn  > 0 && <div className="db-bar-seg db-bar-warn"  style={{ width: `${(warn  / max) * 100}%` }} title={`${warn} Warning`}    />}
+            {info  > 0 && <div className="db-bar-seg db-bar-info"  style={{ width: `${(info  / max) * 100}%` }} title={`${info} Configured`} />}
+            {pass  > 0 && <div className="db-bar-seg db-bar-pass"  style={{ width: `${(pass  / max) * 100}%` }} title={`${pass} Passed`}     />}
           </div>
           <span className="db-bar-total">{total}</span>
         </div>
@@ -153,6 +180,12 @@ function buildRecommendations(findings, targetEnvironment, platform) {
   if (cats.includes('Security Checks') && criticals.some(f => f.category === 'Security Checks')) {
     improvements.push('Remove all hardcoded credentials and store them in a centralised credential store before proceeding to the next environment.');
   }
+  if (cats.includes('Dependencies') && criticals.some(f => f.category === 'Dependencies')) {
+    improvements.push('Resolve all critical dependency issues — upgrade End-of-Life packages and confirm all runtime resources exist in the target environment.');
+  }
+  if (cats.includes('Dependencies') && warnings.some(f => f.category === 'Dependencies' && f.name.startsWith('Package:'))) {
+    improvements.push('Review outdated packages in the Dependencies section and update them to the latest stable versions.');
+  }
   if (cats.includes('Configuration Validation')) {
     improvements.push(`Ensure all configuration values in the project's configuration source are complete and appropriate for ${env}.`);
   }
@@ -160,7 +193,7 @@ function buildRecommendations(findings, targetEnvironment, platform) {
     improvements.push('Replace hardcoded file system paths and connection strings with parameterised values resolved at runtime.');
   }
   if (cats.includes('Environment Validation')) {
-    improvements.push(`Verify all URLs and selectors are valid endpoints for ${env}. Externalise environment-specific values to the configuration source.`);
+    improvements.push(`Verify all selectors and invoked workflow paths are valid for ${env}.`);
   }
   if (improvements.length === 0) {
     improvements.push('Continue regular validation checks as part of the deployment pipeline to maintain quality standards.');
@@ -183,7 +216,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
   const { summary, findings, metadata } = report;
   const envLabel   = targetEnvironment || 'Generic';
   const platLabel  = platform          || 'Auto Detected';
-  const score      = calcReadiness(summary);
+  const score      = calcReadiness(summary, findings);
   const readiness  = readinessLabel(score);
   const recs       = useMemo(() => buildRecommendations(findings, targetEnvironment, platform), [findings, targetEnvironment, platform]);
   const duration   = metadata.validationDurationMs ? formatDuration(metadata.validationDurationMs) : '—';
@@ -244,7 +277,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
       Category:       f.category,
       'Item':         f.name,
       Location:       f.location,
-      Status:         f.status === 'Fail' ? 'Critical' : f.status,
+      Status:         statusMeta(f.status).label,
       Description:    f.issue,
       Recommendation: f.recommendation
     }));
@@ -277,13 +310,14 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
     doc.text('Automation Project Validation Report', 14, 16);
     doc.setFontSize(9);
     doc.text(`Project: ${summary.projectName}  |  Platform: ${platLabel}  |  Environment: ${envLabel}  |  Validated: ${validatedAt}`, 14, 24);
-    doc.text(`Total: ${summary.total}  |  Passed: ${summary.pass}  |  Warnings: ${summary.warning}  |  Critical: ${summary.fail}  |  Readiness: ${score}% — ${readiness.text}`, 14, 30);
+    const infoCount = findings.filter(f => f.status === 'Info').length;
+    doc.text(`Total: ${summary.total}  |  Passed: ${summary.pass}  |  Configured: ${infoCount}  |  Warnings: ${summary.warning}  |  Critical: ${summary.fail}  |  Readiness: ${score}% — ${readiness.text}`, 14, 30);
     autoTable(doc, {
       startY: 36,
       head: [['Category', 'Item', 'Location', 'Status', 'Description', 'Recommendation']],
       body: filtered.map(f => [
         f.category, f.name, f.location,
-        f.status === 'Fail' ? 'Critical' : f.status,
+        statusMeta(f.status).label,
         f.issue, f.recommendation
       ]),
       styles: { fontSize: 7, cellPadding: 2, overflow: 'linebreak' },
@@ -292,9 +326,10 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
       didParseCell: (data) => {
         if (data.column.index === 3 && data.section === 'body') {
           const v = data.cell.raw;
-          if (v === 'Critical') data.cell.styles.textColor = [190, 18, 60];
-          else if (v === 'Warning') data.cell.styles.textColor = [146, 64, 14];
-          else if (v === 'Pass')    data.cell.styles.textColor = [21, 128, 61];
+          if      (v === 'Critical')   data.cell.styles.textColor = [190, 18, 60];
+          else if (v === 'Warning')    data.cell.styles.textColor = [146, 64, 14];
+          else if (v === 'Passed')     data.cell.styles.textColor = [21, 128, 61];
+          else if (v === 'Configured') data.cell.styles.textColor = [29, 78, 216];
         }
       }
     });
@@ -350,6 +385,13 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                 <div className="db-kpi-lbl">Passed</div>
               </div>
             </div>
+            <div className="db-kpi db-kpi-info">
+              <div className="db-kpi-icon" style={{ background: '#eff6ff', color: '#3b82f6' }}>●</div>
+              <div className="db-kpi-body">
+                <div className="db-kpi-val">{findings.filter(f => f.status === 'Info').length}</div>
+                <div className="db-kpi-lbl">Configured</div>
+              </div>
+            </div>
             <div className="db-kpi db-kpi-warn">
               <div className="db-kpi-icon" style={{ background: '#fffbeb', color: '#f59e0b' }}>⚠</div>
               <div className="db-kpi-body">
@@ -401,6 +443,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                 <DoughnutChart pass={summary.pass} warning={summary.warning} fail={summary.fail} />
                 <div className="db-donut-legend">
                   <div className="db-legend-item"><span className="db-legend-dot" style={{ background: '#22c55e' }} />Passed <strong>{summary.pass}</strong></div>
+                  <div className="db-legend-item"><span className="db-legend-dot" style={{ background: '#3b82f6' }} />Configured <strong>{findings.filter(f => f.status === 'Info').length}</strong></div>
                   <div className="db-legend-item"><span className="db-legend-dot" style={{ background: '#f59e0b' }} />Warnings <strong>{summary.warning}</strong></div>
                   <div className="db-legend-item"><span className="db-legend-dot" style={{ background: '#ef4444' }} />Critical <strong>{summary.fail}</strong></div>
                 </div>
@@ -414,6 +457,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
               <div className="db-bar-legend">
                 <span><span className="db-legend-dot" style={{ background: '#ef4444' }} />Critical</span>
                 <span><span className="db-legend-dot" style={{ background: '#f59e0b' }} />Warning</span>
+                <span><span className="db-legend-dot" style={{ background: '#3b82f6' }} />Configured</span>
                 <span><span className="db-legend-dot" style={{ background: '#22c55e' }} />Passed</span>
               </div>
             </div>
@@ -442,12 +486,26 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                   <span className="db-meta-k">Workflow Files</span>
                   <span className="db-meta-v">{summary.xamlFilesAnalyzed}</span>
                 </div>
+                {summary.skippedTestWorkflows && summary.skippedTestWorkflows.length > 0 && (
+                  <div className="db-meta-row">
+                    <span className="db-meta-k">Test Files Skipped</span>
+                    <span className="db-meta-v db-text-info" title={summary.skippedTestWorkflows.join(', ')}>
+                      {summary.skippedTestWorkflows.length} (hover to view)
+                    </span>
+                  </div>
+                )}
                 <div className="db-meta-row">
                   <span className="db-meta-k">Config File</span>
                   <span className={`db-meta-v ${summary.configFound ? 'db-text-pass' : 'db-text-fail'}`}>
                     {summary.configFound ? '✓ Found' : '✕ Missing'}
                   </span>
                 </div>
+                {summary.configSheets && summary.configSheets.length > 0 && (
+                  <div className="db-meta-row">
+                    <span className="db-meta-k">Config Sheets</span>
+                    <span className="db-meta-v db-meta-v-sm">{summary.configSheets.join(', ')}</span>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -473,13 +531,17 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
             </div>
             <div className="db-readiness-right">
               <div className="db-readiness-summary">
-                {score >= 90 && `This project passed ${summary.pass} of ${summary.total} validation checks with ${summary.warning} warning(s) and no critical issues. It is ready for deployment to ${envLabel !== 'Generic' ? envLabel : 'the target environment'}.`}
-                {score >= 70 && score < 90 && `This project has ${summary.warning} warning(s) and ${summary.fail} critical issue(s). Address the critical issues before deployment and review all warnings.`}
-                {score >= 40 && score < 70 && `This project has ${summary.fail} critical issue(s) that must be resolved before it can be deployed. Review all findings in the Findings tab.`}
-                {score < 40 && `This project has significant issues (${summary.fail} critical, ${summary.warning} warnings) and is not ready for deployment. All critical issues must be resolved.`}
+                {(() => {
+                  const info = findings.filter(f => f.status === 'Info').length;
+                  if (score >= 90) return `This project passed ${summary.pass} of ${summary.total} validation checks. ${info > 0 ? `${info} external dependenc${info === 1 ? 'y' : 'ies'} detected and configured — verify in the target environment before deployment. ` : ''}${summary.warning > 0 ? `${summary.warning} warning(s) to review. ` : ''}It is ready for deployment to ${envLabel !== 'Generic' ? envLabel : 'the target environment'}.`;
+                  if (score >= 70) return `This project has ${summary.warning} warning(s) and ${summary.fail} critical issue(s). Address all critical issues before deployment and review the warnings.`;
+                  if (score >= 40) return `This project has ${summary.fail} critical issue(s) that must be resolved before it can be deployed. Review all findings in the Findings tab.`;
+                  return `This project has significant issues (${summary.fail} critical, ${summary.warning} warnings) and is not ready for deployment. All critical issues must be resolved.`;
+                })()}
               </div>
               <div className="db-readiness-stats">
                 <div className="db-rs-item"><span className="db-rs-num">{summary.pass}</span><span className="db-rs-lbl">Passed</span></div>
+                <div className="db-rs-item"><span className="db-rs-num" style={{color:'#3b82f6'}}>{findings.filter(f=>f.status==='Info').length}</span><span className="db-rs-lbl">Configured</span></div>
                 <div className="db-rs-item"><span className="db-rs-num">{summary.warning}</span><span className="db-rs-lbl">Warnings</span></div>
                 <div className="db-rs-item"><span className="db-rs-num">{summary.fail}</span><span className="db-rs-lbl">Critical</span></div>
               </div>
@@ -524,7 +586,13 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                 {[
                   ['Target Environment', envLabel],
                   ['Workflow Files',     summary.xamlFilesAnalyzed],
+                  ...(summary.skippedTestWorkflows && summary.skippedTestWorkflows.length > 0
+                    ? [['Test Files Skipped', `${summary.skippedTestWorkflows.length}: ${summary.skippedTestWorkflows.join(', ')}`]]
+                    : []),
                   ['Configuration File', summary.configFound ? 'Found ✓' : 'Missing ✕'],
+                  ...(summary.configSheets && summary.configSheets.length > 0
+                    ? [['Config Sheets', summary.configSheets.join(', ')]]
+                    : []),
                   ['Validated At',       validatedAt],
                   ['Readiness Score',    `${score}%`],
                   ['Readiness Status',   readiness.text],
@@ -571,6 +639,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
             {categories.filter(c => c !== 'All').map(cat => {
               const catFindings = findings.filter(f => f.category === cat);
               const cPass = catFindings.filter(f => f.status === 'Pass').length;
+              const cInfo = catFindings.filter(f => f.status === 'Info').length;
               const cWarn = catFindings.filter(f => f.status === 'Warning').length;
               const cFail = catFindings.filter(f => f.status === 'Fail').length;
               const color = catColor(cat);
@@ -583,13 +652,18 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                   <div className="db-cat-card-header">
                     <span className="db-cat-card-icon">{icon}</span>
                     <span className="db-cat-card-name">{cat}</span>
-                    {hasIssues
-                      ? <span className="db-cat-card-badge db-cat-badge-issue">{cFail > 0 ? `${cFail} critical` : `${cWarn} warnings`}</span>
-                      : <span className="db-cat-card-badge db-cat-badge-ok">All passed</span>
+                    {cFail > 0
+                      ? <span className="db-cat-card-badge db-cat-badge-issue">{cFail} critical</span>
+                      : cWarn > 0
+                        ? <span className="db-cat-card-badge db-cat-badge-warn">{cWarn} warnings</span>
+                        : cInfo > 0
+                          ? <span className="db-cat-card-badge db-cat-badge-info">{cInfo} configured</span>
+                          : <span className="db-cat-card-badge db-cat-badge-ok">All passed</span>
                     }
                   </div>
                   <div className="db-cat-card-stats">
                     <span className="db-css pass">{cPass} passed</span>
+                    {cInfo > 0 && <span className="db-css info">{cInfo} configured</span>}
                     <span className="db-css warn">{cWarn} warnings</span>
                     <span className="db-css fail">{cFail} critical</span>
                   </div>
@@ -598,6 +672,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                       <div className="db-cat-bar">
                         {cFail > 0 && <div className="db-cat-bar-fail"  style={{ width: `${(cFail / catFindings.length) * 100}%` }} />}
                         {cWarn > 0 && <div className="db-cat-bar-warn"  style={{ width: `${(cWarn / catFindings.length) * 100}%` }} />}
+                        {cInfo > 0 && <div className="db-cat-bar-info"  style={{ width: `${(cInfo / catFindings.length) * 100}%` }} />}
                         {cPass > 0 && <div className="db-cat-bar-pass"  style={{ width: `${(cPass / catFindings.length) * 100}%` }} />}
                       </div>
                     )}
@@ -627,6 +702,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                 onChange={e => { setStatusFilter(e.target.value); resetPage(); }}>
                 <option value="All">All Statuses</option>
                 <option value="Pass">Passed</option>
+                <option value="Info">Configured</option>
                 <option value="Warning">Warning</option>
                 <option value="Fail">Critical</option>
               </select>
@@ -710,7 +786,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                             <td>
                               <span className="db-status-pill"
                                 style={{ background: sm.bg, color: sm.color, borderColor: sm.border }}>
-                                {sm.icon} {f.status === 'Fail' ? 'Critical' : sm.label}
+                                {sm.icon} {sm.label}
                               </span>
                             </td>
                             <td className="db-td-issue">{f.issue}</td>
@@ -739,7 +815,7 @@ export default function Dashboard({ report, targetEnvironment, platform }) {
                                     <div className="db-detail-meta">
                                       <div><strong>Category:</strong> {f.category}</div>
                                       <div><strong>Location:</strong> {f.location}</div>
-                                      <div><strong>Status:</strong> {f.status === 'Fail' ? 'Critical' : f.status}</div>
+                                      <div><strong>Status:</strong> {statusMeta(f.status).label}</div>
                                     </div>
                                   </div>
                                 </div>

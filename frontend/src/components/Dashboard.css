@@ -189,6 +189,7 @@
 .db-bar-seg   { height: 100%; transition: width 0.3s; }
 .db-bar-fail  { background: #ef4444; }
 .db-bar-warn  { background: #f59e0b; }
+.db-bar-info  { background: #3b82f6; }
 .db-bar-pass  { background: #22c55e; }
 .db-bar-total { font-size: 11px; font-weight: 700; color: #374151; width: 22px; text-align: right; flex-shrink: 0; }
 
@@ -207,6 +208,8 @@
 .db-meta-v { font-weight: 600; color: #1f2328; text-align: right; }
 .db-text-pass { color: #15803d !important; }
 .db-text-fail { color: #b91c1c !important; }
+.db-text-info { color: #0369a1 !important; cursor: help; }
+.db-meta-v-sm { font-size: 10px; font-weight: 500; word-break: break-all; }
 .db-env-badge {
   display: inline-block;
   padding: 2px 10px;
@@ -348,6 +351,8 @@
   border-radius: 10px; white-space: nowrap;
 }
 .db-cat-badge-issue { background: #fee2e2; color: #991b1b; }
+.db-cat-badge-warn  { background: #fef9c3; color: #854d0e; }
+.db-cat-badge-info  { background: #dbeafe; color: #1e40af; }
 .db-cat-badge-ok    { background: #dcfce7; color: #15803d; }
 .db-cat-card-stats {
   display: flex;
@@ -361,6 +366,7 @@
   border-radius: 4px;
 }
 .db-css.pass { background: #f0fdf4; color: #15803d; }
+.db-css.info { background: #eff6ff; color: #1d4ed8; }
 .db-css.warn { background: #fffbeb; color: #92400e; }
 .db-css.fail { background: #fff1f2; color: #be123c; }
 .db-cat-progress { }
@@ -370,6 +376,7 @@
 }
 .db-cat-bar-fail { background: #ef4444; }
 .db-cat-bar-warn { background: #f59e0b; }
+.db-cat-bar-info { background: #3b82f6; }
 .db-cat-bar-pass { background: #22c55e; }
 .db-cat-card-cta { font-size: 11px; color: #3b82d4; font-weight: 600; }
 
