@@ -456,32 +456,58 @@ function shouldSkipRow(name, val) {
   return false;
 }
 
+// ── Path classification helper ────────────────────────────────────────────────
+
 /**
- * Build a Set of all config key names referenced in XAML expressions.
+ * Classify a hardcoded absolute or UNC file/executable path into a severity tier.
  *
- * Enterprise REFramework workflows typically read config values as:
- *   Config("KeyName")  or  in_Config("KeyName")
- * This lets us cross-reference blank config keys against XAML usage so we only
- * flag blank values as Critical when the key is actually consumed at runtime.
+ * Returns one of:
+ *   'pass'    — standard Windows system path; legitimate to use as-is
+ *   'info'    — system executable or Windows utility; fixed path is normal practice
+ *   'warning' — user-profile / machine-specific app path; needs verification on target
+ *   'fail'    — arbitrary absolute data/script path that is environment-specific
+ *
+ * Rules:
+ *   1. C:\Windows\System32\*, C:\Windows\SysWOW64\*, C:\Windows\*.exe  → 'info'
+ *      Standard OS executables use fixed system paths by design.
+ *   2. C:\Users\*, %AppData%, AppData\Local, AppData\Roaming,
+ *      Desktop\*, Downloads\*, Temp\*, Temporary*                      → 'warning'
+ *      These are user/machine-specific but may be intentional; flag for review.
+ *   3. Everything else (data files, network shares, application data)   → 'fail'
+ *      Arbitrary absolute paths break portability across environments.
+ *
+ * UNC paths (\\server\share\...) are always 'fail' — server name is environment-specific.
  */
-function buildXamlConfigKeyRefs(xamlData) {
-  const refs = new Set();
-  // Matches: Config("KeyName"), in_Config("KeyName"), config("KeyName"), etc.
-  const CONFIG_REF_RX = /[Cc]onfig\s*\(\s*["']([^"']+)["']\s*\)/g;
-  xamlData.forEach(xf => {
-    if (xf.error) return;
-    // We need the raw file content — re-read it here so we don't bloat the parse result
-    try {
-      const fs   = require('fs');
-      const text = fs.readFileSync(xf.file, 'utf8');
-      CONFIG_REF_RX.lastIndex = 0;
-      let m;
-      while ((m = CONFIG_REF_RX.exec(text)) !== null) {
-        refs.add(m[1].trim());
-      }
-    } catch (_) { /* file may have been cleaned up */ }
-  });
-  return refs;
+function classifyHardcodedPath(fp) {
+  const norm = fp.replace(/\//g, '\\');
+
+  // UNC paths are always environment-specific
+  if (norm.startsWith('\\\\')) return 'fail';
+
+  const upper = norm.toUpperCase();
+
+  // Standard Windows system directories — fixed paths are legitimate here
+  if (upper.startsWith('C:\\WINDOWS\\SYSTEM32\\') ||
+      upper.startsWith('C:\\WINDOWS\\SYSWOW64\\') ||
+      upper.startsWith('C:\\WINDOWS\\') && upper.endsWith('.EXE')) {
+    return 'info';
+  }
+
+  // User-profile and machine-specific application locations
+  if (upper.startsWith('C:\\USERS\\') ||
+      upper.includes('\\APPDATA\\LOCAL\\') ||
+      upper.includes('\\APPDATA\\ROAMING\\') ||
+      upper.includes('\\APPDATA\\') ||
+      upper.includes('\\DESKTOP\\') ||
+      upper.includes('\\DOWNLOADS\\') ||
+      upper.includes('\\TEMP\\') ||
+      upper.includes('\\TEMPORARY ') ||
+      upper.startsWith('C:\\TEMP\\') ||
+      upper.startsWith('C:\\TMP\\')) {
+    return 'warning';
+  }
+
+  return 'fail';
 }
 
 // ── 2. Dependencies (packages + runtime resources) ────────────────────────────
@@ -794,11 +820,30 @@ function analyzeRuntimeDeps(xamlData, configData, targetEnvironment) {
   const hasCfgPaths  = cfgDeps.filePath.length > 0;
 
   if (hasXamlPaths || hasCfgPaths) {
-    // Hardcoded absolute paths in XAML = Fail (env-specific, will break in other envs)
-    emitXamlResource(xamlFilePaths, 'File Path',
-      n => `Hardcoded file system path detected: "${n}". This will break if the path does not exist in ${envRef(targetEnvironment)}.`,
-      () => `Move this path to the configuration source and resolve it dynamically at runtime.`,
-      'Fail');
+    // Hardcoded paths in XAML — classify per path type rather than blanket Fail
+    xamlFilePaths.forEach((files, fp) => {
+      const fileList = [...files].join(', ');
+      const tier = classifyHardcodedPath(fp);
+      if (tier === 'info') {
+        // Standard system executable — fixed path is expected and legitimate
+        findings.push(createFinding('Dependencies', `File Path: ${path.basename(fp)}`,
+          fileList, 'Info',
+          `Standard system executable path referenced: "${fp}". This is a fixed OS path and is expected to be available on Windows targets.`,
+          `Verify the executable is present on the target machine and compatible with ${envRef(targetEnvironment)}.`));
+      } else if (tier === 'warning') {
+        // User-profile / machine-specific app — needs environment verification
+        findings.push(createFinding('Dependencies', `File Path: ${path.basename(fp)}`,
+          fileList, 'Warning',
+          `Environment-specific application path detected: "${fp}". This path is user- or machine-specific and may not resolve on the target agent.`,
+          `Verify the application is installed at this location on the target machine, or resolve the path through configuration.`));
+      } else {
+        // Arbitrary absolute data/script path — genuine portability risk
+        findings.push(createFinding('Dependencies', `File Path: ${path.basename(fp)}`,
+          fileList, 'Fail',
+          `Hardcoded file system path detected: "${fp}". This path is environment-specific and will not resolve if it does not exist in ${envRef(targetEnvironment)}.`,
+          'Move this path to the configuration source and resolve it dynamically at runtime.'));
+      }
+    });
     // Config-driven paths = Info (correctly externalised)
     emitConfigResource(cfgDeps.filePath, 'File Path (config)',
       (k, v, dv) => `File path configured via key "${k}"${dv}. Dependency detected — verify path is accessible in ${envRef(targetEnvironment)}.`,
@@ -814,21 +859,17 @@ function analyzeRuntimeDeps(xamlData, configData, targetEnvironment) {
   if (hasXamlUrls || hasCfgUrls) {
     xamlUrls.forEach((files, url) => {
       const fileList = [...files].join(', ');
-      if (url.toLowerCase().includes('prod') || url.toLowerCase().includes('production')) {
-        // Production-specific hardcoded URL = Fail (env-specific, will break elsewhere)
-        findings.push(createFinding('Dependencies', `URL: ${url.substring(0, 60)}`, fileList, 'Fail',
-          `Production-specific URL hardcoded in workflow: "${url}". Store environment-specific URLs in the configuration source.`,
-          `Move this URL to Config.xlsx so it can be changed per environment.`));
-      } else if (url.startsWith('http://')) {
-        // Insecure protocol = Fail (security policy violation)
+      if (url.startsWith('http://')) {
+        // Insecure protocol = confirmed security policy violation
         findings.push(createFinding('Dependencies', `URL: ${url.substring(0, 60)}`, fileList, 'Fail',
           `Insecure HTTP URL hardcoded in workflow: "${url}". TLS is required per security policy.`,
           'Use HTTPS (TLS 1.2+) for all URLs.'));
       } else {
-        // HTTPS URL hardcoded in XAML — warn that it should be in config, but not critical
-        findings.push(createFinding('Dependencies', `URL: ${url.substring(0, 60)}`, fileList, 'Warning',
-          `URL hardcoded in workflow: "${url}". Consider moving to configuration source for easier environment management.`,
-          `Verify this URL is the correct endpoint for ${envRef(targetEnvironment)}.`));
+        // Hardcoded HTTPS URL — informational: the URL is visible and should be
+        // verified for the target environment, but its mere presence is not an error.
+        findings.push(createFinding('Dependencies', `URL: ${url.substring(0, 60)}`, fileList, 'Info',
+          `URL hardcoded in workflow: "${url}". Verify this is the correct endpoint for ${envRef(targetEnvironment)} and consider moving it to the configuration source.`,
+          `Confirm the URL is correct for ${envRef(targetEnvironment)} and move to Config.xlsx if environment-specific.`));
       }
     });
     // Config-driven URLs = Info (correctly externalised)
@@ -859,17 +900,19 @@ function analyzeDataDeps(xamlData, configData, targetEnvironment) {
     findings.push(createFinding('Configuration Validation', 'Config.xlsx', configData.filePath, 'Pass',
       `Config.xlsx found. Sheets detected: ${sheetNames}.`, ''));
 
-    // Build the set of config keys actually referenced in XAML workflows so that
-    // we only flag blank values as Critical when the key is consumed at runtime.
-    const xamlConfigRefs = buildXamlConfigKeyRefs(xamlData);
-
     // Generic value-based validation across all settings / constants rows.
     // Does NOT require any specific key names — validates every row dynamically.
+    //
+    // Blank / placeholder values are NOT reported regardless of whether the key is
+    // referenced in XAML. A XAML reference alone cannot distinguish whether the key
+    // is used on the primary execution path or only inside conditional, exception,
+    // notification, or logging branches. Without that evidence the validator must
+    // not create a Critical or Warning finding.
     const allConfigRows = [...(configData.settings || []), ...(configData.constants || [])];
 
-    // Track keys we've already flagged to avoid duplicate findings when the same
+    // Track keys we've already checked to avoid duplicate findings when the same
     // key appears in both a Settings sheet and a Constants sheet.
-    const flaggedKeys = new Set();
+    const checkedKeys = new Set();
 
     allConfigRows.forEach(row => {
       const name = extractRowKey(row);
@@ -877,126 +920,45 @@ function analyzeDataDeps(xamlData, configData, targetEnvironment) {
       const desc = String(row.Description || row.description || row.Notes || row.notes || '');
 
       if (shouldSkipRow(name, val)) return;
-      if (flaggedKeys.has((name || '').toLowerCase())) return;
+      if (checkedKeys.has((name || '').toLowerCase())) return;
+      checkedKeys.add((name || '').toLowerCase());
 
-      if (isPlaceholderValue(val, desc)) {
-        // Determine criticality:
-        //   Critical  → key is directly referenced in a XAML workflow expression
-        //   Warning   → key has a critical-sounding name but is not confirmed as XAML-referenced
-        //   Informational (Warning) → key name gives no criticality signal
-        const lowerName = name.toLowerCase();
-        const isXamlReferenced = xamlConfigRefs.size > 0 && xamlConfigRefs.has(name);
-        const isCriticalName   = ['queue', 'asset', 'credential', 'password', 'secret', 'token',
-                                   'connection', 'database', 'server', 'endpoint'].some(k => lowerName.includes(k));
+      // Blank / placeholder: no finding — insufficient evidence of deployment risk.
+      if (isPlaceholderValue(val, desc)) return;
 
-        let status;
-        let issue;
-        if (isXamlReferenced) {
-          status = 'Fail';
-          issue  = `Configuration key "${name}" is referenced in workflow code but has a blank or placeholder value.`;
-        } else if (isCriticalName) {
-          status = 'Warning';
-          issue  = `Configuration key "${name}" has a blank or placeholder value. Verify whether this is required for ${envRef(targetEnvironment)}.`;
-        } else {
-          // Key is not XAML-referenced and name gives no strong signal → informational only
-          status = 'Warning';
-          issue  = `Configuration key "${name}" has no value set. If this key is not used by the workflow, this can be ignored.`;
-        }
-
-        flaggedKeys.add(lowerName);
-        findings.push(createFinding('Configuration Validation', `Config: ${name}`,
-          'Config.xlsx › Settings/Constants', status, issue,
-          `Populate "${name}" with the correct value for ${envRef(targetEnvironment)} or remove the row if it is not required.`));
-
-      } else if (val.toLowerCase().includes('prod') || val.toLowerCase().includes('production')) {
-        // Production-specific value detected — warn only when deploying to non-prod or unknown env
+      if (val.toLowerCase().includes('prod') || val.toLowerCase().includes('production')) {
+        // A value containing "prod" is informational when a non-prod target is selected.
+        // The word "prod" appearing in a value string is not strong evidence of an
+        // environment mismatch — it may be part of a product name, path component, or
+        // unrelated term. Surface it for human review rather than assuming it is wrong.
         const isDeployingToProd = !targetEnvironment ||
           targetEnvironment.toLowerCase().includes('prod');
         if (!isDeployingToProd) {
           findings.push(createFinding('Configuration Validation', `Config: ${name}`,
-            'Config.xlsx › Settings/Constants', 'Warning',
-            `Configuration key "${name}" contains a production-specific value: "${val}". Verify this is correct for ${envRef(targetEnvironment)}.`,
-            `Update "${name}" to the value appropriate for ${envRef(targetEnvironment)}.`));
+            'Config.xlsx › Settings/Constants', 'Info',
+            `Configuration key "${name}" has a value that contains "prod" or "production": "${val}". Verify this is intended for ${envRef(targetEnvironment)}.`,
+            `Review whether "${name}" should use a different value for ${envRef(targetEnvironment)}.`));
         }
-        // URL values are valid populated config — no separate URL warning needed here.
-        // URL-type keys are already covered in the Dependencies section.
       }
     });
 
-    // Assets sheet — dynamic, no predefined names expected
+    // Assets sheet — dynamic, no predefined names expected.
+    // A blank asset alias/value is NOT flagged: the asset sheet is informational.
+    // Its entries are already surfaced in the Dependencies section.
     const assetRows = configData.assets || [];
     if (assetRows.length > 0) {
       findings.push(createFinding('Configuration Validation', 'Assets Sheet', 'Config.xlsx › Assets', 'Pass',
         `Assets sheet found with ${assetRows.length} configured asset(s).`, ''));
-
-      assetRows.forEach(row => {
-        const assetName  = extractRowKey(row) ||
-          String(row.Asset || row.asset || row.Alias || row.alias || '').trim();
-        const assetValue = String(row.Asset || row.asset || row.Value || row.value || row.Alias || row.alias || '').trim();
-
-        if (!assetName && !assetValue) return;
-        if (!assetName) return;
-
-        if (isPlaceholderValue(assetValue)) {
-          findings.push(createFinding('Configuration Validation', `Asset: ${assetName}`,
-            'Config.xlsx › Assets', 'Warning',
-            `Asset "${assetName}" is listed but has no mapped Orchestrator asset name.`,
-            `Ensure "${assetName}" is mapped to a valid Orchestrator asset in ${envRef(targetEnvironment)}.`));
-        }
-      });
     }
 
     // Environment-specific sheets (Dev / UAT / Prod)
-    // Consolidate blank-value findings across all env sheets by key:
-    // if the same key is blank in Dev, UAT, and Prod → report once listing all envs.
-    const envSheets = configData.envSheets || {};
-    const envNames  = Object.keys(envSheets);
-
-    // Per-key accumulator: normKey → { name, envsMissing[], envsFailing[], desc }
-    const envKeyMap = new Map();
-
-    Object.entries(envSheets).forEach(([env, rows]) => {
+    // Blank keys in env sheets are NOT reported. The validator cannot determine
+    // from static analysis alone whether a blank env-sheet value is required for
+    // the primary execution path or is only used conditionally/optionally.
+    Object.entries(configData.envSheets || {}).forEach(([env, rows]) => {
       findings.push(createFinding('Configuration Validation', `Environment Sheet: ${env}`,
         'Config.xlsx', 'Pass',
         `${env} configuration sheet detected with ${rows.length} row(s).`, ''));
-
-      rows.forEach(row => {
-        const name = extractRowKey(row);
-        const val  = extractRowValue(row);
-        const desc = String(row.Description || row.description || row.Notes || row.notes || '');
-        if (shouldSkipRow(name, val)) return;
-        if (!isPlaceholderValue(val, desc)) return;
-
-        const normKey    = (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const lowerName  = (name || '').toLowerCase();
-        const isCritical = ['queue', 'asset', 'credential', 'password', 'secret', 'token',
-                             'connection', 'database', 'server', 'url', 'endpoint'].some(k => lowerName.includes(k));
-
-        if (!envKeyMap.has(normKey)) {
-          envKeyMap.set(normKey, { name, isCritical, envsMissing: [] });
-        }
-        envKeyMap.get(normKey).envsMissing.push(env);
-      });
-    });
-
-    // Emit one consolidated finding per key, scoped to target env when set.
-    envKeyMap.forEach(({ name, isCritical, envsMissing }) => {
-      // If a target env is specified, only include that env's blanks.
-      const relevantEnvs = targetEnvironment
-        ? envsMissing.filter(e =>
-            e.toLowerCase().includes(targetEnvironment.toLowerCase()) ||
-            targetEnvironment.toLowerCase().includes(e.toLowerCase()))
-        : envsMissing;
-
-      if (relevantEnvs.length === 0) return;
-
-      const envList  = relevantEnvs.join(', ');
-      const status   = isCritical ? 'Fail' : 'Warning';
-      const envLabel = relevantEnvs.length === 1 ? relevantEnvs[0] : `[${envList}]`;
-      findings.push(createFinding('Configuration Validation', `Config [${envLabel}]: ${name}`,
-        `Config.xlsx › ${relevantEnvs.join(' / ')}`, status,
-        `Configuration key "${name}" has a blank or placeholder value in the ${envList} sheet(s).`,
-        `Populate "${name}" with the correct value for the ${envList} environment(s).`));
     });
   }
 
@@ -1010,13 +972,16 @@ function analyzeDataDeps(xamlData, configData, targetEnvironment) {
       if (seenPaths.has(key)) return;
       seenPaths.add(key);
       if (fp.match(/^[A-Za-z]:\\/)) {
+        // Absolute local path hardcoded in workflow — confirmed portability problem
         findings.push(createFinding('External Resources', `Excel File: ${path.basename(fp)}`, xf.fileName, 'Fail',
-          `Hardcoded absolute Excel path found: "${fp}".`,
-          'Move the file path to the project configuration source or a Credential Asset.'));
+          `Hardcoded absolute Excel path found: "${fp}". This path is machine-specific and will not resolve in other environments.`,
+          'Move the file path to the configuration source so it can be adjusted per environment.'));
       } else {
-        findings.push(createFinding('External Resources', `Excel File: ${path.basename(fp)}`, xf.fileName, 'Warning',
-          `Excel file reference: "${fp}". Verify the file is accessible in the target environment.`,
-          `Ensure the automation agent has read/write access to this file in ${envRef(targetEnvironment)}.`));
+        // Relative or UNC path — the resource is external and cannot be verified from the
+        // project package alone. Surface for human review, not as a confirmed problem.
+        findings.push(createFinding('External Resources', `Excel File: ${path.basename(fp)}`, xf.fileName, 'Info',
+          `External Excel file reference detected: "${fp}". The resource is outside the uploaded project and its availability in ${envRef(targetEnvironment)} cannot be verified from the project package.`,
+          `Confirm the file is accessible to the automation agent in ${envRef(targetEnvironment)}.`));
       }
     });
 
@@ -1045,19 +1010,32 @@ function analyzeAppDeps(xamlData, targetEnvironment) {
     }
 
     xf.selectorIssues.forEach(si => {
+      // Selector portability — a real and specific structural concern: the selector
+      // attribute is a literal that ties the automation to a specific environment/machine.
       findings.push(createFinding('Environment Validation', `Selector [${si.attr}="${si.value}"]`, xf.fileName, 'Warning',
-        `Hardcoded selector attribute ${si.attr}="${si.value}" may not be portable across environments.`,
-        `Parameterise the "${si.attr}" attribute using a variable from the configuration source.`));
+        `Hardcoded selector attribute ${si.attr}="${si.value}" in "${xf.fileName}" may not match across environments or machines.`,
+        `Parameterise the "${si.attr}" attribute using a wildcard or a variable read from the configuration source.`));
     });
 
-    // Hardcoded absolute file paths in workflows go to External Resources
+    // Hardcoded absolute file paths in workflows — classify before reporting
     xf.filePaths.forEach(fp => {
       const key = `path|${fp}|${xf.fileName}`;
       if (seenUrls.has(key)) return;
       seenUrls.add(key);
-      findings.push(createFinding('External Resources', `File Path: ${path.basename(fp)}`, xf.fileName, 'Fail',
-        `Hardcoded file system path detected: "${fp}".`,
-        'Move this path to the configuration source and resolve it dynamically at runtime.'));
+      const tier = classifyHardcodedPath(fp);
+      if (tier === 'info') {
+        findings.push(createFinding('External Resources', `File Path: ${path.basename(fp)}`, xf.fileName, 'Info',
+          `Standard system executable path referenced: "${fp}". This is a fixed OS path and is expected to be available on Windows targets.`,
+          `Verify the executable is present on the target machine and compatible with ${envRef(targetEnvironment)}.`));
+      } else if (tier === 'warning') {
+        findings.push(createFinding('External Resources', `File Path: ${path.basename(fp)}`, xf.fileName, 'Warning',
+          `Environment-specific application path detected: "${fp}". This path is user- or machine-specific and may not resolve on the target agent.`,
+          `Verify the application is installed at this location on the target machine, or resolve the path through configuration.`));
+      } else {
+        findings.push(createFinding('External Resources', `File Path: ${path.basename(fp)}`, xf.fileName, 'Fail',
+          `Hardcoded file system path detected: "${fp}". This path is environment-specific and will not resolve if it does not exist in ${envRef(targetEnvironment)}.`,
+          'Move this path to the configuration source and resolve it dynamically at runtime.'));
+      }
     });
 
     xf.invokedWorkflows.forEach(wf => {
@@ -1074,6 +1052,40 @@ function analyzeAppDeps(xamlData, targetEnvironment) {
 
 // ── 5. Security Checks ───────────────────────────────────────────────────────
 
+/**
+ * Returns true when a value string has characteristics of a real secret/credential:
+ *  - High entropy (many unique characters relative to length)
+ *  - Resembles a known token/key format (base64, hex, JWT segments)
+ *  - Long enough to be a generated secret (>= 16 chars)
+ *  - NOT a plain word, short ID, numeric count, URL, path, boolean, or email address
+ */
+function looksLikeSecret(val) {
+  if (!val || val.trim().length < 16) return false;
+  const v = val.trim();
+
+  // Skip obvious non-secrets regardless of length
+  if (/^https?:\/\//i.test(v)) return false;           // URL
+  if (/^[A-Za-z]:\\/.test(v) || /^\\\\/.test(v)) return false; // file path
+  if (/^\d+$/.test(v)) return false;                   // pure numeric (count/timeout)
+  if (/^(true|false|yes|no)$/i.test(v)) return false;  // boolean
+  if (/^[\w.+-]+@[\w.-]+\.[a-z]{2,}$/i.test(v)) return false; // email address
+
+  // JWT: three base64url segments separated by dots
+  if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v)) return true;
+
+  // Base64-encoded block (no spaces, only base64 chars, length divisible by 4 or with padding)
+  if (/^[A-Za-z0-9+/]{16,}={0,2}$/.test(v) && v.length % 4 === 0) return true;
+
+  // Hex string (common for API keys, hashes)
+  if (/^[0-9a-fA-F]{32,}$/.test(v)) return true;
+
+  // High character entropy: >= 16 chars and unique-char ratio > 0.6
+  const unique = new Set(v.split('')).size;
+  if (v.length >= 16 && unique / v.length > 0.6) return true;
+
+  return false;
+}
+
 function analyzeIntegrations(xamlData, configData) {
   const findings = [];
 
@@ -1086,13 +1098,28 @@ function analyzeIntegrations(xamlData, configData) {
     allRows.forEach(row => {
       const name = String(extractRowKey(row) || '').toLowerCase();
       const val  = extractRowValue(row);
-      const isCredLike = ['password', 'secret', 'token', 'apikey', 'api_key', 'credential', 'pwd'].some(k => name.includes(k));
-      if (isCredLike && val && val.trim() !== '' &&
-          !val.toLowerCase().startsWith('asset:') &&
-          !val.toLowerCase().startsWith('orchestrator')) {
+      if (!val || !val.trim()) return; // blank — not a hardcoded credential
+
+      // Key name must suggest a credential AND the actual value must look like a secret.
+      // Key name alone is NOT sufficient — "token", "secret", "key" appear in many
+      // non-credential config names (e.g. retry counts, interval flags, API endpoint names).
+      const isCredLikeName = ['password', 'secret', 'token', 'apikey', 'api_key', 'credential', 'pwd'].some(k => name.includes(k));
+      if (!isCredLikeName) return;
+
+      // Explicitly safe value prefixes — asset/orchestrator references are not hardcoded
+      if (val.toLowerCase().startsWith('asset:') || val.toLowerCase().startsWith('orchestrator')) return;
+
+      if (looksLikeSecret(val)) {
+        // Value has characteristics of a real secret — report as Fail
         findings.push(createFinding('Security Checks', `Config: ${name}`, 'Config.xlsx', 'Fail',
-          `Potential hardcoded credential found in Config.xlsx for key "${name}".`,
-          'Remove the credential value from the configuration file and store it as a Credential Asset.'));
+          `Potential hardcoded credential found in Config.xlsx for key "${name}". The value has characteristics of a secret or access token.`,
+          'Remove the credential value from the configuration file and store it as a Credential Asset or in a secure vault.'));
+      } else {
+        // Name looks credential-related but value is not proven to be a secret —
+        // informational only to avoid false positives on retry counts, intervals, etc.
+        findings.push(createFinding('Security Checks', `Config: ${name}`, 'Config.xlsx', 'Info',
+          `Configuration key "${name}" has a credential-like name. Review the value to confirm it does not contain a plaintext secret.`,
+          'If this value is a secret or access token, store it as a Credential Asset rather than in Config.xlsx.'));
       }
     });
   }
@@ -1100,9 +1127,21 @@ function analyzeIntegrations(xamlData, configData) {
   xamlData.forEach(xf => {
     if (xf.error) return;
     (xf.inlineCredentials || []).forEach(match => {
-      findings.push(createFinding('Security Checks', 'Inline Credential', xf.fileName, 'Fail',
-        `Potential hardcoded credential detected: "${match}".`,
-        'Remove hardcoded credentials from all workflow files. Use a Credential Asset or IBM Key Protect.'));
+      // The XAML parser already filters non-literals ({x:Null}, [expr]). The match
+      // contains the full attribute=value fragment. Apply the same value-content check
+      // to avoid flagging attribute names that happen to contain "token"/"secret" but
+      // whose values are non-secret literals (e.g. token="bearer_type_label").
+      const valueMatch = match.match(/=\s*"([^"]+)"/);
+      const rawVal = valueMatch ? valueMatch[1] : match;
+      if (looksLikeSecret(rawVal)) {
+        findings.push(createFinding('Security Checks', 'Inline Credential', xf.fileName, 'Fail',
+          'Potential hardcoded credential detected in workflow file. The value has characteristics of a secret or access token.',
+          'Remove hardcoded credentials from all workflow files. Use a Credential Asset or a secure vault.'));
+      } else {
+        findings.push(createFinding('Security Checks', 'Inline Credential (review)', xf.fileName, 'Info',
+          `A credential-like attribute was detected in "${xf.fileName}". Review to confirm the value is not a plaintext secret.`,
+          'If this value is a secret or access token, store it as a Credential Asset rather than hardcoding it in the workflow.'));
+      }
     });
   });
 
